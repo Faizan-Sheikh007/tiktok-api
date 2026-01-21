@@ -1,23 +1,19 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import yt_dlp
-import os
-import uuid
+import httpx
 import logging
 from datetime import datetime
-import time
-from pathlib import Path
-import asyncio
+import os
+import re
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CyberOrion TikTok Downloader API",
-    version="3.0",
-    description="Download TikTok videos without watermark - Enhanced with Cookie Support"
+    version="4.0",
+    description="Download TikTok videos without watermark - No cookies required"
 )
 
 # CORS Configuration
@@ -41,86 +37,197 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
-# Directories
-DOWNLOAD_DIR = '/tmp/downloads'
-COOKIES_FILE = 'cookies.txt'  # Place cookies.txt in root directory
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-logger.info(f"✅ Download directory: {DOWNLOAD_DIR}")
-
-# Check for cookies file
-if os.path.exists(COOKIES_FILE):
-    logger.info(f"✅ Cookies file found: {COOKIES_FILE}")
-else:
-    logger.warning(f"⚠️ Cookies file not found: {COOKIES_FILE}")
-    logger.warning("TikTok downloads may fail without cookies!")
-
-def cleanup_old_files():
-    """Delete files older than 30 minutes"""
-    try:
-        current_time = time.time()
-        if not os.path.exists(DOWNLOAD_DIR):
-            return
-            
-        for filename in os.listdir(DOWNLOAD_DIR):
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-            if os.path.isfile(filepath):
-                if current_time - os.path.getmtime(filepath) > 1800:
-                    os.remove(filepath)
-                    logger.info(f"🗑️ Cleaned up: {filename}")
-    except Exception as e:
-        logger.error(f"❌ Cleanup error: {str(e)}")
+# API endpoints
+TIKWM_API = "https://www.tikwm.com/api/"
+TIKMATE_API = "https://tikmate.app/api/lookup"
 
 class RateLimiter:
-    """Simple rate limiter to avoid TikTok blocks"""
-    def __init__(self, max_requests=5, time_window=60):
+    """Simple rate limiter"""
+    def __init__(self, max_requests=10, time_window=60):
         self.max_requests = max_requests
         self.time_window = time_window
-        self.requests = []
+        self.requests = {}
     
-    async def check_rate_limit(self):
+    def check_rate_limit(self, ip: str):
+        import time
         now = time.time()
-        # Remove old requests
-        self.requests = [r for r in self.requests if now - r < self.time_window]
         
-        if len(self.requests) >= self.max_requests:
-            wait_time = self.time_window - (now - self.requests[0])
-            logger.warning(f"⚠️ Rate limit hit. Waiting {wait_time:.1f}s")
+        if ip not in self.requests:
+            self.requests[ip] = []
+        
+        # Remove old requests
+        self.requests[ip] = [r for r in self.requests[ip] if now - r < self.time_window]
+        
+        if len(self.requests[ip]) >= self.max_requests:
+            wait_time = self.time_window - (now - self.requests[ip][0])
             raise HTTPException(
                 status_code=429,
                 detail={
                     "error": "Too many requests",
-                    "message": f"Please wait {int(wait_time)} seconds before trying again",
+                    "message": f"Please wait {int(wait_time)} seconds",
                     "retry_after": int(wait_time)
                 }
             )
         
-        self.requests.append(now)
+        self.requests[ip].append(now)
 
-rate_limiter = RateLimiter(max_requests=5, time_window=60)
+rate_limiter = RateLimiter(max_requests=10, time_window=60)
+
+def extract_video_id(url: str) -> str:
+    """Extract video ID from TikTok URL"""
+    patterns = [
+        r'/@[\w.-]+/video/(\d+)',
+        r'/v/(\d+)',
+        r'video/(\d+)',
+        r'/(\d+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    return None
+
+async def download_with_tikwm(url: str) -> dict:
+    """Download using TikWM API (Primary method)"""
+    try:
+        logger.info(f"🔄 Trying TikWM API for: {url}")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                TIKWM_API,
+                data={
+                    "url": url,
+                    "hd": "1"
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json"
+                }
+            )
+            
+            logger.info(f"TikWM response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(f"TikWM response data: {data}")
+                
+                if data.get("code") == 0:
+                    video_data = data.get("data", {})
+                    
+                    # Get video URL (try HD first, fallback to SD)
+                    video_url = video_data.get("hdplay") or video_data.get("play")
+                    
+                    if not video_url:
+                        logger.error("No video URL found in response")
+                        return {"success": False, "error": "No video URL in response"}
+                    
+                    logger.info(f"✅ TikWM Success! Video URL: {video_url[:50]}...")
+                    
+                    return {
+                        "success": True,
+                        "download_url": video_url,
+                        "title": video_data.get("title", "TikTok Video"),
+                        "author": video_data.get("author", {}).get("unique_id", "Unknown"),
+                        "caption": video_data.get("title", ""),
+                        "thumbnail": video_data.get("cover", ""),
+                        "duration": video_data.get("duration", 0),
+                        "plays": video_data.get("play_count", 0),
+                        "likes": video_data.get("digg_count", 0),
+                        "comments": video_data.get("comment_count", 0),
+                        "shares": video_data.get("share_count", 0),
+                        "api_source": "TikWM"
+                    }
+                else:
+                    error_msg = data.get("msg", "Unknown error")
+                    logger.error(f"TikWM API error: {error_msg}")
+                    return {"success": False, "error": f"TikWM: {error_msg}"}
+            else:
+                logger.error(f"TikWM status code: {response.status_code}")
+                return {"success": False, "error": f"TikWM returned {response.status_code}"}
+                
+    except httpx.TimeoutException:
+        logger.error("TikWM timeout")
+        return {"success": False, "error": "TikWM API timeout"}
+    except Exception as e:
+        logger.error(f"TikWM exception: {str(e)}")
+        return {"success": False, "error": f"TikWM error: {str(e)}"}
+
+async def download_with_snapsave(url: str) -> dict:
+    """Download using SnapSave API (Fallback method)"""
+    try:
+        logger.info(f"🔄 Trying SnapSave API for: {url}")
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # SnapSave requires a two-step process
+            response = await client.post(
+                "https://snapsave.app/action.php?lang=en",
+                data={
+                    "url": url
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "*/*"
+                }
+            )
+            
+            if response.status_code == 200:
+                # Parse HTML response to extract download URL
+                html = response.text
+                
+                # Look for download URL in HTML
+                import re
+                url_pattern = r'href="([^"]+)"[^>]*>Download'
+                match = re.search(url_pattern, html)
+                
+                if match:
+                    download_url = match.group(1)
+                    logger.info(f"✅ SnapSave Success!")
+                    
+                    return {
+                        "success": True,
+                        "download_url": download_url,
+                        "title": "TikTok Video",
+                        "author": "Unknown",
+                        "caption": "",
+                        "thumbnail": "",
+                        "api_source": "SnapSave"
+                    }
+                else:
+                    return {"success": False, "error": "Could not parse SnapSave response"}
+            else:
+                return {"success": False, "error": f"SnapSave returned {response.status_code}"}
+                
+    except Exception as e:
+        logger.error(f"SnapSave exception: {str(e)}")
+        return {"success": False, "error": f"SnapSave error: {str(e)}"}
 
 @app.get("/")
 async def root():
     """API information endpoint"""
-    cookies_status = "✅ Available" if os.path.exists(COOKIES_FILE) else "❌ Missing"
-    
     return {
         "status": "running",
         "service": "CyberOrion TikTok Downloader API",
-        "version": "3.0",
+        "version": "4.0",
+        "method": "External API (No cookies needed)",
         "platform": "Render.com",
-        "cookies": cookies_status,
         "framework": "FastAPI",
+        "apis": {
+            "primary": "TikWM API",
+            "fallback": "SnapSave API"
+        },
         "features": [
-            "Cookie-based authentication",
+            "No cookies required",
+            "HD video quality",
             "Rate limiting",
-            "Auto cleanup",
-            "Enhanced error handling"
+            "Auto-fallback",
+            "Video metadata"
         ],
         "endpoints": {
             "/download": "POST - Download TikTok video",
-            "/health": "GET - Health check",
-            "/files/{filename}": "GET - Serve downloaded file"
+            "/health": "GET - Health check"
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -128,40 +235,21 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    try:
-        file_count = len([f for f in os.listdir(DOWNLOAD_DIR) if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))])
-        cookies_exists = os.path.exists(COOKIES_FILE)
-        
-        return {
-            "status": "healthy" if cookies_exists else "degraded",
-            "cookies_available": cookies_exists,
-            "platform": "Render.com",
-            "framework": "FastAPI",
-            "download_dir": DOWNLOAD_DIR,
-            "files_cached": file_count,
-            "rate_limiter": {
-                "max_requests": rate_limiter.max_requests,
-                "time_window": rate_limiter.time_window,
-                "current_requests": len(rate_limiter.requests)
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return JSONResponse(
-            content={"status": "error", "error": str(e)},
-            status_code=500
-        )
+    return {
+        "status": "healthy",
+        "method": "External API",
+        "requires_cookies": False,
+        "platform": "Render.com",
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.post("/download")
 async def download_video(request: Request):
-    """Download TikTok video without watermark"""
-    
+    """Download TikTok video using external APIs"""
     try:
-        # Check rate limit
-        await rate_limiter.check_rate_limit()
-        
-        # Clean up old files
-        cleanup_old_files()
+        # Rate limiting
+        client_ip = request.client.host
+        rate_limiter.check_rate_limit(client_ip)
         
         # Get request data
         data = await request.json()
@@ -184,223 +272,85 @@ async def download_video(request: Request):
                 status_code=400
             )
         
-        # Check if it's a photo/slideshow post
+        # Check for photo posts
         if '/photo/' in tiktok_url:
             logger.info(f"⚠️ Photo post detected: {tiktok_url}")
             return JSONResponse(
                 content={
                     "success": False, 
-                    "error": "TikTok photo posts (slideshows) are not supported. Please try a video post instead."
+                    "error": "TikTok photo posts (slideshows) are not supported. Please use a video post."
                 },
                 status_code=400
             )
         
         logger.info(f"🎬 Processing: {tiktok_url}")
+        logger.info(f"📍 Client IP: {client_ip}")
         
-        # Generate unique filename
-        unique_id = str(uuid.uuid4())[:8]
-        output_filename = f"tiktok_{unique_id}.mp4"
-        output_path = os.path.join(DOWNLOAD_DIR, output_filename)
+        # Try TikWM API first
+        result = await download_with_tikwm(tiktok_url)
         
-        # Enhanced yt-dlp configuration with cookies
-        ydl_opts = {
-            'format': 'best',
-            'outtmpl': output_path,
-            'quiet': False,
-            'no_warnings': False,
-            'verbose': True,
+        # If TikWM fails, try SnapSave as fallback
+        if not result.get("success"):
+            logger.warning(f"⚠️ TikWM failed, trying SnapSave...")
+            result = await download_with_snapsave(tiktok_url)
+        
+        if result.get("success"):
+            logger.info(f"✅ Success via {result.get('api_source', 'Unknown')} API")
             
-            # CRITICAL: Use cookies if available
-            'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
-            
-            # Enhanced headers to mimic real browser
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Referer': 'https://www.tiktok.com/',
-                'Origin': 'https://www.tiktok.com',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Sec-Fetch-User': '?1',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-                'Sec-Ch-Ua-Mobile': '?0',
-                'Sec-Ch-Ua-Platform': '"Windows"',
-            },
-            
-            # TikTok specific extractor arguments
-            'extractor_args': {
-                'tiktok': {
-                    'api_hostname': 'api16-normal-c-useast1a.tiktokv.com',
-                    'webpage_download_max_retries': 5,
+            # Return response matching your Laravel controller's expected format
+            return JSONResponse(content={
+                "success": True,
+                "download_url": result["download_url"],
+                "full_url": result["download_url"],  # Direct URL from API
+                "title": result.get("title", "TikTok Video"),
+                "author": result.get("author", "Unknown"),
+                "caption": result.get("caption", "No caption available"),
+                "thumbnail": result.get("thumbnail", ""),
+                "filename": f"tiktok_video.mp4",
+                "message": "Video ready for download",
+                "api_source": result.get("api_source", "External API"),
+                "stats": {
+                    "duration": result.get("duration", 0),
+                    "plays": result.get("plays", 0),
+                    "likes": result.get("likes", 0),
+                    "comments": result.get("comments", 0),
+                    "shares": result.get("shares", 0)
                 }
-            },
+            })
+        else:
+            error_msg = result.get("error", "All download methods failed")
+            logger.error(f"❌ All APIs failed: {error_msg}")
             
-            # Network settings
-            'retries': 10,
-            'fragment_retries': 10,
-            'skip_unavailable_fragments': True,
-            'socket_timeout': 60,
-            'nocheckcertificate': True,
-            'geo_bypass': True,
-            'geo_bypass_country': 'US',
-        }
-        
-        # Download video
-        logger.info("📥 Starting download...")
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(tiktok_url, download=True)
-                
-                # Extract metadata
-                title = info.get('title', 'TikTok Video')
-                author = info.get('uploader', info.get('creator', 'Unknown'))
-                description = info.get('description', 'No caption available')
-                thumbnail = info.get('thumbnail', '')
-                
-                # Get actual filename
-                actual_filename = ydl.prepare_filename(info)
-                
-                logger.info(f"✅ Downloaded successfully!")
-        
-        except yt_dlp.utils.ExtractorError as e:
-            error_msg = str(e)
-            logger.error(f"❌ Extractor error: {error_msg}")
-            
-            # Provide specific error messages
-            if "Unable to extract webpage video data" in error_msg:
-                if not os.path.exists(COOKIES_FILE):
-                    return JSONResponse(
-                        content={
-                            "success": False,
-                            "error": "TikTok extraction failed - Cookies required",
-                            "message": "This error occurs because TikTok blocks automated requests. The server needs a cookies.txt file to work.",
-                            "solutions": [
-                                "Server administrator needs to add cookies.txt file",
-                                "Cookies should be exported from a logged-in TikTok session",
-                                "Cookies expire every few hours and need regular updates"
-                            ]
-                        },
-                        status_code=503
-                    )
-                else:
-                    return JSONResponse(
-                        content={
-                            "success": False,
-                            "error": "TikTok extraction failed - Cookies may be expired",
-                            "message": "The cookies file exists but may be outdated. TikTok cookies expire frequently.",
-                            "solutions": [
-                                "Update cookies.txt with fresh cookies from browser",
-                                "Ensure you're logged into TikTok when exporting cookies",
-                                "Try again in a few minutes (TikTok may be rate limiting)"
-                            ]
-                        },
-                        status_code=503
-                    )
-            elif "Private video" in error_msg:
-                return JSONResponse(
-                    content={"success": False, "error": "This video is private"},
-                    status_code=403
-                )
-            elif "Video unavailable" in error_msg or "404" in error_msg:
-                return JSONResponse(
-                    content={"success": False, "error": "Video not found or has been deleted"},
-                    status_code=404
-                )
-            else:
-                return JSONResponse(
-                    content={"success": False, "error": f"Download failed: {error_msg}"},
-                    status_code=500
-                )
-        
-        # Verify file exists
-        if not os.path.exists(output_path):
-            if os.path.exists(actual_filename):
-                output_path = actual_filename
-                output_filename = os.path.basename(actual_filename)
-            else:
-                logger.error(f"❌ File not found: {output_path}")
-                return JSONResponse(
-                    content={"success": False, "error": "Video file not found after download"},
-                    status_code=500
-                )
-        
-        # Get base URL
-        base_url = os.environ.get('RENDER_EXTERNAL_URL', str(request.base_url).rstrip('/'))
-        
-        # Generate URLs
-        file_url = f"/files/{output_filename}"
-        full_url = f"{base_url}{file_url}"
-        
-        logger.info(f"🎉 Success! URL: {full_url}")
-        
-        return JSONResponse(content={
-            "success": True,
-            "video": file_url,
-            "full_url": full_url,
-            "title": title,
-            "author": author,
-            "caption": description,
-            "thumbnail": thumbnail,
-            "filename": output_filename,
-            "message": "Video downloaded successfully"
-        })
+            return JSONResponse(
+                content={
+                    "success": False,
+                    "error": error_msg,
+                    "tried_apis": ["TikWM", "SnapSave"],
+                    "suggestion": "Please verify the TikTok URL is correct and the video is public"
+                },
+                status_code=503
+            )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
         return JSONResponse(
-            content={"success": False, "error": f"Server error: {str(e)}"},
+            content={
+                "success": False, 
+                "error": f"Server error: {str(e)}"
+            },
             status_code=500
         )
 
-@app.get("/files/{filename}")
-async def serve_file(filename: str):
-    """Serve downloaded video file"""
-    try:
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        
-        if not os.path.exists(filepath):
-            logger.warning(f"⚠️ File not found: {filename}")
-            return JSONResponse(
-                content={"success": False, "error": "File not found"},
-                status_code=404
-            )
-        
-        logger.info(f"📤 Serving: {filename}")
-        
-        return FileResponse(
-            filepath,
-            media_type="video/mp4",
-            filename=filename,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Expose-Headers": "*"
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Serve error: {str(e)}")
-        return JSONResponse(
-            content={"success": False, "error": "Failed to serve file"},
-            status_code=500
-        )
-
-@app.options("/files/{filename}")
-async def serve_file_options(filename: str):
-    """Handle CORS preflight for file serving"""
+@app.options("/download")
+async def download_options():
+    """Handle CORS preflight for download endpoint"""
     return JSONResponse(
         content={},
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
             "Access-Control-Allow-Headers": "*",
         }
     )
@@ -408,4 +358,5 @@ async def serve_file_options(filename: str):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    logger.info(f"🚀 Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
