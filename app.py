@@ -18,7 +18,7 @@ app = FastAPI(
     description="Download TikTok videos without watermark"
 )
 
-# CORS Configuration
+# ✅ IMPROVED CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -26,12 +26,17 @@ app.add_middleware(
         "http://cybervid.online",
         "https://www.cybervid.online",
         "http://www.cybervid.online",
-        "http://localhost:*",
-        "http://127.0.0.1:*"
+        "http://localhost:3000",
+        "http://localhost:5500",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5500",
+        "http://127.0.0.1:8000"
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"]
+    allow_methods=["GET", "POST", "OPTIONS", "DELETE", "PUT"],
+    allow_headers=["*"],
+    expose_headers=["*"]  # ✅ Important for file downloads
 )
 
 # Create downloads directory - Use /tmp on Render
@@ -241,6 +246,7 @@ async def download_video(request: Request):
             status_code=500
         )
 
+# ✅ FIXED: File serving endpoint with explicit CORS headers
 @app.get("/files/{filename}")
 async def serve_file(filename: str):
     """Serve downloaded video file"""
@@ -256,10 +262,17 @@ async def serve_file(filename: str):
         
         logger.info(f"📤 Serving: {filename}")
         
+        # ✅ Add explicit CORS headers to FileResponse
         return FileResponse(
             filepath,
             media_type="video/mp4",
-            filename=filename
+            filename=filename,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Expose-Headers": "*"
+            }
         )
         
     except Exception as e:
@@ -268,6 +281,19 @@ async def serve_file(filename: str):
             content={"success": False, "error": "Failed to serve file"},
             status_code=500
         )
+
+# ✅ NEW: Handle preflight OPTIONS requests for file endpoint
+@app.options("/files/{filename}")
+async def serve_file_options(filename: str):
+    """Handle CORS preflight for file serving"""
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 # For local development
 if __name__ == "__main__":
