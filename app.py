@@ -36,7 +36,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS", "DELETE", "PUT"],
     allow_headers=["*"],
-    expose_headers=["*"]  # ✅ Important for file downloads
+    expose_headers=["*"]
 )
 
 # Create downloads directory - Use /tmp on Render
@@ -127,14 +127,17 @@ async def download_video(request: Request):
                 status_code=400
             )
         
-        logger.info(f"🎬 Processing: {tiktok_url}")
+        # ✅ Check if it's a photo/slideshow post
+        is_photo_post = '/photo/' in tiktok_url
+        
+        logger.info(f"🎬 Processing: {tiktok_url} (Type: {'Photo' if is_photo_post else 'Video'})")
         
         # Generate unique filename
         unique_id = str(uuid.uuid4())[:8]
         output_filename = f"tiktok_{unique_id}.mp4"
         output_path = os.path.join(DOWNLOAD_DIR, output_filename)
         
-        # yt-dlp configuration
+        # ✅ UPDATED yt-dlp configuration with TikTok extractor
         ydl_opts = {
             'format': 'best',
             'outtmpl': output_path,
@@ -142,24 +145,37 @@ async def download_video(request: Request):
             'no_warnings': False,
             'extract_flat': False,
             
+            # ✅ Force TikTok extractor
+            'extractor_args': {
+                'tiktok': {
+                    'api_hostname': 'api22-normal-c-alisg.tiktokv.com'
+                }
+            },
+            
             # Bypass restrictions
             'nocheckcertificate': True,
             'geo_bypass': True,
             'geo_bypass_country': 'US',
-            'proxy': None,
             
-            # Headers
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            # ✅ Updated Headers for 2025
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-us,en;q=0.5',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.tiktok.com/',
+                'Origin': 'https://www.tiktok.com',
+                'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
             },
             
             # Retry settings
-            'retries': 5,
-            'fragment_retries': 5,
+            'retries': 10,
+            'fragment_retries': 10,
             'skip_unavailable_fragments': True,
             'socket_timeout': 30,
         }
@@ -172,7 +188,7 @@ async def download_video(request: Request):
             
             # Extract metadata
             title = info.get('title', 'TikTok Video')
-            author = info.get('uploader', 'Unknown')
+            author = info.get('uploader', info.get('creator', 'Unknown'))
             description = info.get('description', 'No caption available')
             thumbnail = info.get('thumbnail', '')
             
@@ -187,9 +203,9 @@ async def download_video(request: Request):
                 output_path = actual_filename
                 output_filename = os.path.basename(actual_filename)
             else:
-                logger.error(f"❌ File not found")
+                logger.error(f"❌ File not found: {output_path}")
                 return JSONResponse(
-                    content={"success": False, "error": "Video file not found"},
+                    content={"success": False, "error": "Video file not found after download"},
                     status_code=500
                 )
         
@@ -211,26 +227,36 @@ async def download_video(request: Request):
             "caption": description,
             "thumbnail": thumbnail,
             "filename": output_filename,
-            "message": "Video downloaded successfully"
+            "message": "Video downloaded successfully",
+            "type": "photo" if is_photo_post else "video"
         })
         
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)
         logger.error(f"❌ yt-dlp error: {error_msg}")
         
-        if "Private video" in error_msg:
+        # ✅ Handle "Unsupported URL" for photo posts
+        if "Unsupported URL" in error_msg and "/photo/" in tiktok_url:
             return JSONResponse(
-                content={"success": False, "error": "Private video"},
+                content={
+                    "success": False, 
+                    "error": "TikTok photo posts (slideshows) are not supported. Please try a video post instead."
+                },
+                status_code=400
+            )
+        elif "Private video" in error_msg:
+            return JSONResponse(
+                content={"success": False, "error": "This is a private video"},
                 status_code=403
             )
         elif "Video unavailable" in error_msg or "404" in error_msg:
             return JSONResponse(
-                content={"success": False, "error": "Video not found"},
+                content={"success": False, "error": "Video not found or has been deleted"},
                 status_code=404
             )
         elif "403" in error_msg or "Forbidden" in error_msg:
             return JSONResponse(
-                content={"success": False, "error": "Access forbidden. Try again later."},
+                content={"success": False, "error": "Access forbidden. The video may be region-restricted."},
                 status_code=403
             )
         else:
@@ -262,7 +288,6 @@ async def serve_file(filename: str):
         
         logger.info(f"📤 Serving: {filename}")
         
-        # ✅ Add explicit CORS headers to FileResponse
         return FileResponse(
             filepath,
             media_type="video/mp4",
@@ -282,7 +307,7 @@ async def serve_file(filename: str):
             status_code=500
         )
 
-# ✅ NEW: Handle preflight OPTIONS requests for file endpoint
+# ✅ Handle preflight OPTIONS requests for file endpoint
 @app.options("/files/{filename}")
 async def serve_file_options(filename: str):
     """Handle CORS preflight for file serving"""
