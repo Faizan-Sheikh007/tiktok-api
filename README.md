@@ -1,0 +1,5 @@
+Flask==3.0.0
+Flask-CORS==4.0.0
+yt-dlp==2023.12.30
+gunicorn==21.2.0
+Werkzeug==3.0.0
