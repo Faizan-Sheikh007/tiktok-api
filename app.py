@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CyberOrion TikTok Downloader API",
-    version="4.0",
+    version="4.2",
     description="Download TikTok videos without watermark - No cookies required"
 )
 
@@ -111,19 +111,41 @@ async def download_with_tikwm(url: str) -> dict:
             
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"TikWM response data: {data}")
+                logger.info(f"TikWM response data keys: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
                 
                 if data.get("code") == 0:
                     video_data = data.get("data", {})
                     
-                    # Get video URL (try HD first, fallback to SD)
-                    video_url = video_data.get("hdplay") or video_data.get("play")
+                    # FIXED: Proper priority for video URLs
+                    # Priority order: wmplay (watermark-free) > hdplay (HD) > play (SD)
+                    video_url = None
+                    url_source = None
+                    
+                    # First try wmplay (best - no watermark)
+                    if video_data.get("wmplay"):
+                        video_url = video_data.get("wmplay")
+                        url_source = "wmplay (watermark-free)"
+                    # Then try hdplay (HD quality)
+                    elif video_data.get("hdplay"):
+                        video_url = video_data.get("hdplay")
+                        url_source = "hdplay (HD)"
+                    # Finally fallback to play (standard definition)
+                    elif video_data.get("play"):
+                        video_url = video_data.get("play")
+                        url_source = "play (SD)"
                     
                     if not video_url:
                         logger.error("No video URL found in response")
+                        logger.error(f"Available keys in video_data: {video_data.keys()}")
                         return {"success": False, "error": "No video URL in response"}
                     
-                    logger.info(f"✅ TikWM Success! Video URL: {video_url[:50]}...")
+                    # Validate URL format
+                    if not video_url.startswith('http'):
+                        logger.error(f"Invalid video URL format: {video_url}")
+                        return {"success": False, "error": "Invalid video URL format"}
+                    
+                    logger.info(f"✅ TikWM Success! Using {url_source}")
+                    logger.info(f"Video URL: {video_url[:80]}...")
                     
                     return {
                         "success": True,
@@ -137,6 +159,7 @@ async def download_with_tikwm(url: str) -> dict:
                         "likes": video_data.get("digg_count", 0),
                         "comments": video_data.get("comment_count", 0),
                         "shares": video_data.get("share_count", 0),
+                        "url_source": url_source,
                         "api_source": "TikWM"
                     }
                 else:
@@ -210,7 +233,7 @@ async def root():
     return {
         "status": "running",
         "service": "CyberOrion TikTok Downloader API",
-        "version": "4.0",
+        "version": "4.2",
         "method": "External API (No cookies needed)",
         "platform": "Render.com",
         "framework": "FastAPI",
@@ -220,14 +243,20 @@ async def root():
         },
         "features": [
             "No cookies required",
-            "HD video quality",
+            "HD video quality (wmplay priority)",
             "Rate limiting",
             "Auto-fallback",
-            "Video metadata"
+            "Video metadata",
+            "Fixed audio-only bug"
         ],
         "endpoints": {
             "/download": "POST - Download TikTok video",
             "/health": "GET - Health check"
+        },
+        "changelog": {
+            "v4.2": "Fixed video URL priority (wmplay > hdplay > play)",
+            "v4.1": "Added URL validation",
+            "v4.0": "Initial external API implementation"
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -309,6 +338,7 @@ async def download_video(request: Request):
                 "filename": f"tiktok_video.mp4",
                 "message": "Video ready for download",
                 "api_source": result.get("api_source", "External API"),
+                "url_source": result.get("url_source", "Unknown"),  # Shows which URL type was used
                 "stats": {
                     "duration": result.get("duration", 0),
                     "plays": result.get("plays", 0),
