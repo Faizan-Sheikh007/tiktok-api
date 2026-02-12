@@ -6,14 +6,15 @@ import logging
 from datetime import datetime
 import os
 import re
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CyberOrion TikTok Downloader API",
-    version="4.2",
-    description="Download TikTok videos without watermark - No cookies required"
+    version="5.0",
+    description="Download TikTok videos without watermark - Multiple API fallbacks"
 )
 
 # CORS Configuration
@@ -39,7 +40,9 @@ app.add_middleware(
 
 # API endpoints
 TIKWM_API = "https://www.tikwm.com/api/"
-TIKMATE_API = "https://tikmate.app/api/lookup"
+SSSTIK_API = "https://ssstik.io/abc?url=dl"
+MUSICALDOWN_API = "https://musicaldown.com/download"
+TIKMATE_API = "https://tikmate.app/download"
 
 class RateLimiter:
     """Simple rate limiter"""
@@ -90,16 +93,17 @@ def extract_video_id(url: str) -> str:
     return None
 
 async def download_with_tikwm(url: str) -> dict:
-    """Download using TikWM API (Primary method)"""
+    """Download using TikWM API - Method 1 (Best for metadata)"""
     try:
-        logger.info(f"🔄 Trying TikWM API for: {url}")
+        logger.info(f"🔄 [1/4] Trying TikWM API for: {url}")
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 TIKWM_API,
                 data={
                     "url": url,
-                    "hd": "1"
+                    "hd": "1",
+                    "watermark": "0"  # Request no watermark
                 },
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -111,103 +115,208 @@ async def download_with_tikwm(url: str) -> dict:
             
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"TikWM response data keys: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
                 
                 if data.get("code") == 0:
                     video_data = data.get("data", {})
                     
-                    # FIXED: Proper priority for video URLs
-                    # Priority order: wmplay (watermark-free) > hdplay (HD) > play (SD)
+                    # Priority: wmplay > hdplay > play
                     video_url = None
                     url_source = None
+                    has_watermark = True
                     
-                    # First try wmplay (best - no watermark)
+                    # Check for watermark-free URLs first
                     if video_data.get("wmplay"):
                         video_url = video_data.get("wmplay")
-                        url_source = "wmplay (watermark-free)"
-                    # Then try hdplay (HD quality)
+                        url_source = "wmplay"
+                        has_watermark = False
                     elif video_data.get("hdplay"):
                         video_url = video_data.get("hdplay")
-                        url_source = "hdplay (HD)"
-                    # Finally fallback to play (standard definition)
+                        url_source = "hdplay"
+                        has_watermark = True  # hdplay usually has watermark
                     elif video_data.get("play"):
                         video_url = video_data.get("play")
-                        url_source = "play (SD)"
+                        url_source = "play"
+                        has_watermark = True
                     
-                    if not video_url:
-                        logger.error("No video URL found in response")
-                        logger.error(f"Available keys in video_data: {video_data.keys()}")
-                        return {"success": False, "error": "No video URL in response"}
-                    
-                    # Validate URL format
-                    if not video_url.startswith('http'):
-                        logger.error(f"Invalid video URL format: {video_url}")
-                        return {"success": False, "error": "Invalid video URL format"}
-                    
-                    logger.info(f"✅ TikWM Success! Using {url_source}")
-                    logger.info(f"Video URL: {video_url[:80]}...")
-                    
-                    return {
-                        "success": True,
-                        "download_url": video_url,
-                        "title": video_data.get("title", "TikTok Video"),
-                        "author": video_data.get("author", {}).get("unique_id", "Unknown"),
-                        "caption": video_data.get("title", ""),
-                        "thumbnail": video_data.get("cover", ""),
-                        "duration": video_data.get("duration", 0),
-                        "plays": video_data.get("play_count", 0),
-                        "likes": video_data.get("digg_count", 0),
-                        "comments": video_data.get("comment_count", 0),
-                        "shares": video_data.get("share_count", 0),
-                        "url_source": url_source,
-                        "api_source": "TikWM"
-                    }
-                else:
-                    error_msg = data.get("msg", "Unknown error")
-                    logger.error(f"TikWM API error: {error_msg}")
-                    return {"success": False, "error": f"TikWM: {error_msg}"}
-            else:
-                logger.error(f"TikWM status code: {response.status_code}")
-                return {"success": False, "error": f"TikWM returned {response.status_code}"}
+                    if video_url and video_url.startswith('http'):
+                        logger.info(f"✅ TikWM returned {url_source} URL (watermark: {has_watermark})")
+                        
+                        return {
+                            "success": True,
+                            "download_url": video_url,
+                            "title": video_data.get("title", "TikTok Video"),
+                            "author": video_data.get("author", {}).get("unique_id", "Unknown"),
+                            "caption": video_data.get("title", ""),
+                            "thumbnail": video_data.get("cover", ""),
+                            "duration": video_data.get("duration", 0),
+                            "plays": video_data.get("play_count", 0),
+                            "likes": video_data.get("digg_count", 0),
+                            "comments": video_data.get("comment_count", 0),
+                            "shares": video_data.get("share_count", 0),
+                            "has_watermark": has_watermark,
+                            "url_source": url_source,
+                            "api_source": "TikWM"
+                        }
                 
-    except httpx.TimeoutException:
-        logger.error("TikWM timeout")
-        return {"success": False, "error": "TikWM API timeout"}
+                logger.error(f"TikWM failed: {data.get('msg', 'No valid video URL')}")
+                return {"success": False, "error": "TikWM: No valid URL"}
+            
+            return {"success": False, "error": f"TikWM status {response.status_code}"}
+                
     except Exception as e:
         logger.error(f"TikWM exception: {str(e)}")
         return {"success": False, "error": f"TikWM error: {str(e)}"}
 
-async def download_with_snapsave(url: str) -> dict:
-    """Download using SnapSave API (Fallback method)"""
+async def download_with_ssstik(url: str) -> dict:
+    """Download using SSSTik API - Method 2 (Good for watermark-free)"""
     try:
-        logger.info(f"🔄 Trying SnapSave API for: {url}")
+        logger.info(f"🔄 [2/4] Trying SSSTik API for: {url}")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # SnapSave requires a two-step process
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            # SSSTik requires specific headers
             response = await client.post(
-                "https://snapsave.app/action.php?lang=en",
+                SSSTIK_API,
+                data={
+                    "id": url,
+                    "locale": "en",
+                    "tt": "d2F0ZXJtYXJr"  # Base64 for watermark settings
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "*/*",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Origin": "https://ssstik.io",
+                    "Referer": "https://ssstik.io/en"
+                }
+            )
+            
+            if response.status_code == 200:
+                html = response.text
+                
+                # Extract download link from HTML
+                # SSSTik returns HTML with download links
+                patterns = [
+                    r'<a[^>]+href="([^"]+)"[^>]*>\s*Without watermark',
+                    r'href="([^"]+)"[^>]*download[^>]*>.*?without',
+                    r'<a[^>]+class="[^"]*download[^"]*"[^>]+href="([^"]+)"'
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, html, re.IGNORECASE)
+                    if match:
+                        download_url = match.group(1)
+                        logger.info(f"✅ SSSTik Success! Watermark-free URL found")
+                        
+                        return {
+                            "success": True,
+                            "download_url": download_url,
+                            "title": "TikTok Video",
+                            "author": "Unknown",
+                            "caption": "",
+                            "thumbnail": "",
+                            "has_watermark": False,
+                            "api_source": "SSSTik"
+                        }
+                
+                logger.error("SSSTik: Could not extract download URL")
+                return {"success": False, "error": "SSSTik: No download URL found"}
+            
+            return {"success": False, "error": f"SSSTik status {response.status_code}"}
+                
+    except Exception as e:
+        logger.error(f"SSSTik exception: {str(e)}")
+        return {"success": False, "error": f"SSSTik error: {str(e)}"}
+
+async def download_with_musicaldown(url: str) -> dict:
+    """Download using MusicalDown API - Method 3 (Watermark-free specialist)"""
+    try:
+        logger.info(f"🔄 [3/4] Trying MusicalDown API for: {url}")
+        
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            # Step 1: Submit URL
+            response = await client.post(
+                MUSICALDOWN_API,
                 data={
                     "url": url
                 },
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "*/*"
+                    "Origin": "https://musicaldown.com",
+                    "Referer": "https://musicaldown.com/"
                 }
             )
             
             if response.status_code == 200:
-                # Parse HTML response to extract download URL
                 html = response.text
                 
-                # Look for download URL in HTML
-                import re
-                url_pattern = r'href="([^"]+)"[^>]*>Download'
-                match = re.search(url_pattern, html)
+                # Extract download link
+                patterns = [
+                    r'href="([^"]+)"[^>]*>.*?Download\s+Server\s+01',
+                    r'href="([^"]+)"[^>]*class="[^"]*download[^"]*"',
+                    r'<a[^>]+href="([^"]+)"[^>]*>\s*Download'
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, html, re.IGNORECASE)
+                    if match:
+                        download_url = match.group(1)
+                        
+                        # Make absolute URL if needed
+                        if not download_url.startswith('http'):
+                            download_url = f"https://musicaldown.com{download_url}"
+                        
+                        logger.info(f"✅ MusicalDown Success! No watermark")
+                        
+                        return {
+                            "success": True,
+                            "download_url": download_url,
+                            "title": "TikTok Video",
+                            "author": "Unknown",
+                            "caption": "",
+                            "thumbnail": "",
+                            "has_watermark": False,
+                            "api_source": "MusicalDown"
+                        }
+                
+                return {"success": False, "error": "MusicalDown: No download URL"}
+            
+            return {"success": False, "error": f"MusicalDown status {response.status_code}"}
+                
+    except Exception as e:
+        logger.error(f"MusicalDown exception: {str(e)}")
+        return {"success": False, "error": f"MusicalDown error: {str(e)}"}
+
+async def download_with_snaptik(url: str) -> dict:
+    """Download using SnapTik API - Method 4 (Last resort, watermark-free)"""
+    try:
+        logger.info(f"🔄 [4/4] Trying SnapTik API for: {url}")
+        
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.post(
+                "https://snaptik.app/abc2.php",
+                data={
+                    "url": url,
+                    "lang": "en"
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://snaptik.app",
+                    "Referer": "https://snaptik.app/"
+                }
+            )
+            
+            if response.status_code == 200:
+                html = response.text
+                
+                # Extract download link
+                pattern = r'href="([^"]+)"[^>]*download[^>]*>'
+                match = re.search(pattern, html, re.IGNORECASE)
                 
                 if match:
                     download_url = match.group(1)
-                    logger.info(f"✅ SnapSave Success!")
+                    logger.info(f"✅ SnapTik Success!")
                     
                     return {
                         "success": True,
@@ -216,16 +325,17 @@ async def download_with_snapsave(url: str) -> dict:
                         "author": "Unknown",
                         "caption": "",
                         "thumbnail": "",
-                        "api_source": "SnapSave"
+                        "has_watermark": False,
+                        "api_source": "SnapTik"
                     }
-                else:
-                    return {"success": False, "error": "Could not parse SnapSave response"}
-            else:
-                return {"success": False, "error": f"SnapSave returned {response.status_code}"}
+                
+                return {"success": False, "error": "SnapTik: No download URL"}
+            
+            return {"success": False, "error": f"SnapTik status {response.status_code}"}
                 
     except Exception as e:
-        logger.error(f"SnapSave exception: {str(e)}")
-        return {"success": False, "error": f"SnapSave error: {str(e)}"}
+        logger.error(f"SnapTik exception: {str(e)}")
+        return {"success": False, "error": f"SnapTik error: {str(e)}"}
 
 @app.get("/")
 async def root():
@@ -233,30 +343,28 @@ async def root():
     return {
         "status": "running",
         "service": "CyberOrion TikTok Downloader API",
-        "version": "4.2",
-        "method": "External API (No cookies needed)",
+        "version": "5.0",
+        "method": "Multi-API Watermark-Free Download",
         "platform": "Render.com",
         "framework": "FastAPI",
         "apis": {
-            "primary": "TikWM API",
-            "fallback": "SnapSave API"
+            "method_1": "TikWM API (metadata + download)",
+            "method_2": "SSSTik API (watermark-free)",
+            "method_3": "MusicalDown API (watermark-free)",
+            "method_4": "SnapTik API (watermark-free)"
         },
         "features": [
             "No cookies required",
-            "HD video quality (wmplay priority)",
+            "Watermark-free priority",
+            "4-layer fallback system",
+            "HD video quality",
             "Rate limiting",
-            "Auto-fallback",
-            "Video metadata",
-            "Fixed audio-only bug"
+            "Video metadata"
         ],
+        "watermark_info": "Tries watermark-free sources first, falls back if needed",
         "endpoints": {
             "/download": "POST - Download TikTok video",
             "/health": "GET - Health check"
-        },
-        "changelog": {
-            "v4.2": "Fixed video URL priority (wmplay > hdplay > play)",
-            "v4.1": "Added URL validation",
-            "v4.0": "Initial external API implementation"
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -266,7 +374,8 @@ async def health():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "method": "External API",
+        "method": "Multi-API",
+        "watermark_free": True,
         "requires_cookies": False,
         "platform": "Render.com",
         "timestamp": datetime.now().isoformat()
@@ -274,7 +383,7 @@ async def health():
 
 @app.post("/download")
 async def download_video(request: Request):
-    """Download TikTok video using external APIs"""
+    """Download TikTok video using multiple APIs for watermark-free downloads"""
     try:
         # Rate limiting
         client_ip = request.client.host
@@ -315,22 +424,43 @@ async def download_video(request: Request):
         logger.info(f"🎬 Processing: {tiktok_url}")
         logger.info(f"📍 Client IP: {client_ip}")
         
-        # Try TikWM API first
+        # Try multiple methods in order, prioritizing watermark-free
+        result = None
+        
+        # Method 1: TikWM (best for metadata, check if watermark-free)
         result = await download_with_tikwm(tiktok_url)
         
-        # If TikWM fails, try SnapSave as fallback
-        if not result.get("success"):
-            logger.warning(f"⚠️ TikWM failed, trying SnapSave...")
-            result = await download_with_snapsave(tiktok_url)
-        
-        if result.get("success"):
-            logger.info(f"✅ Success via {result.get('api_source', 'Unknown')} API")
+        # If TikWM has watermark or failed, try watermark-free specialists
+        if not result.get("success") or result.get("has_watermark", True):
+            if result.get("has_watermark"):
+                logger.warning(f"⚠️ TikWM returned video WITH watermark, trying watermark-free APIs...")
             
-            # Return response matching your Laravel controller's expected format
+            # Method 2: SSSTik (watermark-free specialist)
+            result2 = await download_with_ssstik(tiktok_url)
+            if result2.get("success"):
+                result = result2
+            else:
+                # Method 3: MusicalDown (another watermark-free option)
+                result3 = await download_with_musicaldown(tiktok_url)
+                if result3.get("success"):
+                    result = result3
+                else:
+                    # Method 4: SnapTik (last resort)
+                    result4 = await download_with_snaptik(tiktok_url)
+                    if result4.get("success"):
+                        result = result4
+                    # If all watermark-free failed, use TikWM result (even with watermark)
+                    elif result.get("success"):
+                        logger.warning("⚠️ All watermark-free APIs failed, using TikWM with watermark")
+        
+        if result and result.get("success"):
+            logger.info(f"✅ Success via {result.get('api_source', 'Unknown')} API (watermark: {result.get('has_watermark', 'unknown')})")
+            
+            # Return response
             return JSONResponse(content={
                 "success": True,
                 "download_url": result["download_url"],
-                "full_url": result["download_url"],  # Direct URL from API
+                "full_url": result["download_url"],
                 "title": result.get("title", "TikTok Video"),
                 "author": result.get("author", "Unknown"),
                 "caption": result.get("caption", "No caption available"),
@@ -338,7 +468,8 @@ async def download_video(request: Request):
                 "filename": f"tiktok_video.mp4",
                 "message": "Video ready for download",
                 "api_source": result.get("api_source", "External API"),
-                "url_source": result.get("url_source", "Unknown"),  # Shows which URL type was used
+                "has_watermark": result.get("has_watermark", False),
+                "url_source": result.get("url_source", "N/A"),
                 "stats": {
                     "duration": result.get("duration", 0),
                     "plays": result.get("plays", 0),
@@ -348,14 +479,14 @@ async def download_video(request: Request):
                 }
             })
         else:
-            error_msg = result.get("error", "All download methods failed")
+            error_msg = result.get("error", "All download methods failed") if result else "All download methods failed"
             logger.error(f"❌ All APIs failed: {error_msg}")
             
             return JSONResponse(
                 content={
                     "success": False,
                     "error": error_msg,
-                    "tried_apis": ["TikWM", "SnapSave"],
+                    "tried_apis": ["TikWM", "SSSTik", "MusicalDown", "SnapTik"],
                     "suggestion": "Please verify the TikTok URL is correct and the video is public"
                 },
                 status_code=503
