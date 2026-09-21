@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from collections import defaultdict, deque
-from typing import Any
+from typing import Any, Callable, Awaitable
 from urllib.parse import urlparse
 
 import httpx
@@ -13,15 +14,31 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 
 try:
+    import yt_dlp
     from yt_dlp import YoutubeDL
 except Exception:  # pragma: no cover
+    yt_dlp = None
     YoutubeDL = None
+
+try:
+    import curl_cffi  # noqa: F401
+    CURL_CFFI_AVAILABLE = True
+except Exception:  # pragma: no cover
+    CURL_CFFI_AVAILABLE = False
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cybervid")
 
-APP_VERSION = "5.0"
-TIKWM_API = "https://www.tikwm.com/api/"
+APP_VERSION = "6.0"
+TIKWM_API = os.getenv("TIKWM_API_URL", "https://tikwm.com/api/").strip()
+TDOWN_API = os.getenv("TDOWN_API_URL", "https://tdownv4.sl-bjs.workers.dev/").strip()
+GODOWNLOADER_API = os.getenv(
+    "GODOWNLOADER_API_URL",
+    "https://godownloader.com/api/tiktok-no-watermark-free",
+).strip()
+ENABLE_TDOWN = os.getenv("ENABLE_TDOWN", "true").lower() == "true"
+ENABLE_GODOWNLOADER = os.getenv("ENABLE_GODOWNLOADER", "false").lower() == "true"
+ENABLE_YTDLP = os.getenv("ENABLE_YTDLP", "true").lower() == "true"
 API_SHARED_SECRET = os.getenv("API_SHARED_SECRET", "").strip()
 DEBUG_PROVIDER_ERRORS = os.getenv("DEBUG_PROVIDER_ERRORS", "false").lower() == "true"
 
@@ -100,6 +117,47 @@ def validate_tiktok_url(value: str) -> str:
     return value
 
 
+def safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_result(
+    *,
+    media_url: str,
+    title: str = "TikTok Video",
+    author: str = "Unknown",
+    caption: str = "",
+    thumbnail: str = "",
+    duration: Any = 0,
+    plays: Any = 0,
+    likes: Any = 0,
+    comments: Any = 0,
+    shares: Any = 0,
+    source: str,
+) -> dict[str, Any]:
+    if not media_url or not media_url.startswith(("http://", "https://")):
+        raise RuntimeError(f"{source} returned an invalid media URL")
+    return {
+        "success": True,
+        "download_url": media_url,
+        "full_url": media_url,
+        "title": title or "TikTok Video",
+        "author": author or "Unknown",
+        "caption": caption or title or "",
+        "thumbnail": thumbnail or "",
+        "duration": safe_int(duration),
+        "plays": safe_int(plays),
+        "likes": safe_int(likes),
+        "comments": safe_int(comments),
+        "shares": safe_int(shares),
+        "filename": "tiktok_video.mp4",
+        "api_source": source,
+    }
+
+
 def parse_tikwm(data: dict[str, Any]) -> dict[str, Any]:
     if data.get("code") not in (0, "0"):
         raise RuntimeError(str(data.get("msg") or data.get("message") or "TikWM rejected the request"))
@@ -115,62 +173,145 @@ def parse_tikwm(data: dict[str, Any]) -> dict[str, Any]:
     else:
         author = str(author_data or "Unknown")
 
-    return {
-        "success": True,
-        "download_url": media_url,
-        "full_url": media_url,
-        "title": video.get("title") or "TikTok Video",
-        "author": author,
-        "caption": video.get("title") or "",
-        "thumbnail": video.get("cover") or video.get("origin_cover") or "",
-        "duration": video.get("duration") or 0,
-        "plays": video.get("play_count") or 0,
-        "likes": video.get("digg_count") or 0,
-        "comments": video.get("comment_count") or 0,
-        "shares": video.get("share_count") or 0,
-        "filename": "tiktok_video.mp4",
-        "api_source": "TikWM",
-    }
+    return normalize_result(
+        media_url=media_url,
+        title=video.get("title") or "TikTok Video",
+        author=author,
+        caption=video.get("title") or "",
+        thumbnail=video.get("cover") or video.get("origin_cover") or "",
+        duration=video.get("duration"),
+        plays=video.get("play_count"),
+        likes=video.get("digg_count"),
+        comments=video.get("comment_count"),
+        shares=video.get("share_count"),
+        source="TikWM",
+    )
 
 
 async def download_with_tikwm(url: str) -> dict[str, Any]:
+    # Use tikwm.com (not www) because current maintained wrappers target this host.
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Origin": "https://www.tikwm.com",
-        "Referer": "https://www.tikwm.com/",
+        "Referer": "https://tikwm.com/",
     }
-    timeout = httpx.Timeout(30.0, connect=12.0)
-
+    timeout = httpx.Timeout(12.0, connect=7.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-        # TikWM's public interface is primarily GET-based. The older CyberVid
-        # deployment only POSTed here, so try GET first and keep POST as a compatibility fallback.
-        last_error = "TikWM request failed"
-        for method in ("GET", "POST"):
-            try:
-                if method == "GET":
-                    response = await client.get(TIKWM_API, params={"url": url, "hd": "1"})
-                else:
-                    response = await client.post(TIKWM_API, data={"url": url, "hd": "1"})
+        response = await client.get(TIKWM_API, params={"url": url, "hd": "1"})
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        try:
+            return parse_tikwm(response.json())
+        except ValueError as exc:
+            raise RuntimeError("non-JSON response") from exc
 
-                if response.status_code != 200:
-                    last_error = f"TikWM returned HTTP {response.status_code}"
-                    continue
 
-                try:
-                    payload = response.json()
-                except ValueError:
-                    last_error = "TikWM returned a non-JSON response"
-                    continue
+def _find_url(obj: Any, keys: tuple[str, ...]) -> str | None:
+    if isinstance(obj, dict):
+        for key in keys:
+            value = obj.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+        for value in obj.values():
+            found = _find_url(value, keys)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_url(value, keys)
+            if found:
+                return found
+    return None
 
-                return parse_tikwm(payload)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                last_error = f"TikWM network error: {type(exc).__name__}"
-            except Exception as exc:
-                last_error = str(exc)
 
-    raise RuntimeError(last_error)
+def _find_text(obj: Any, keys: tuple[str, ...], default: str = "") -> str:
+    if isinstance(obj, dict):
+        for key in keys:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in obj.values():
+            found = _find_text(value, keys, "")
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_text(value, keys, "")
+            if found:
+                return found
+    return default
+
+
+async def download_with_tdown(url: str) -> dict[str, Any]:
+    if not ENABLE_TDOWN:
+        raise RuntimeError("disabled")
+    timeout = httpx.Timeout(15.0, connect=7.0)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        response = await client.get(TDOWN_API, params={"down": url})
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("non-JSON response") from exc
+
+    media_url = _find_url(data, ("download_url", "downloadUrl", "nowm", "no_watermark", "play", "video_url", "video"))
+    if not media_url:
+        raise RuntimeError(str(data.get("error") or data.get("message") or "no download URL"))
+
+    author_obj = data.get("author") if isinstance(data, dict) else None
+    if isinstance(author_obj, dict):
+        author = author_obj.get("username") or author_obj.get("unique_id") or author_obj.get("nickname") or "Unknown"
+    else:
+        author = _find_text(data, ("username", "unique_id", "author"), "Unknown")
+
+    return normalize_result(
+        media_url=media_url,
+        title=_find_text(data, ("title", "caption", "description"), "TikTok Video"),
+        author=author,
+        caption=_find_text(data, ("caption", "description", "title"), ""),
+        thumbnail=_find_url(data, ("thumbnail", "cover", "image", "avatar")) or "",
+        duration=(author_obj or {}).get("duration", 0) if isinstance(author_obj, dict) else 0,
+        plays=(author_obj or {}).get("view_count", 0) if isinstance(author_obj, dict) else 0,
+        likes=(author_obj or {}).get("like_count", 0) if isinstance(author_obj, dict) else 0,
+        source="TDOWN",
+    )
+
+
+async def download_with_godownloader(url: str) -> dict[str, Any]:
+    if not ENABLE_GODOWNLOADER:
+        raise RuntimeError("disabled")
+    timeout = httpx.Timeout(15.0, connect=7.0)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        response = await client.get(GODOWNLOADER_API, params={"url": url, "key": "godownloader.com"})
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("non-JSON response") from exc
+
+    media_url = _find_url(data, ("download_url", "downloadUrl", "video", "video_url", "nowm", "play"))
+    if not media_url:
+        raise RuntimeError(str(data.get("error") or data.get("message") or "no download URL"))
+
+    return normalize_result(
+        media_url=media_url,
+        title=_find_text(data, ("title", "caption", "description"), "TikTok Video"),
+        author=_find_text(data, ("author", "username", "unique_id"), "Unknown"),
+        caption=_find_text(data, ("caption", "description", "title"), ""),
+        thumbnail=_find_url(data, ("thumbnail", "cover", "image")) or "",
+        source="GoDownloader",
+    )
 
 
 def _yt_dlp_extract(url: str) -> dict[str, Any]:
@@ -183,13 +324,19 @@ def _yt_dlp_extract(url: str) -> dict[str, Any]:
         "skip_download": True,
         "noplaylist": True,
         "cachedir": False,
-        "socket_timeout": 30,
+        "socket_timeout": 25,
         "retries": 1,
+        "extractor_retries": 1,
         "format": "best[ext=mp4]/best",
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
         },
     }
+
+    # Current yt-dlp can use curl_cffi browser impersonation automatically when
+    # available. Keep the option explicit for generic HTTP requests as well.
+    if CURL_CFFI_AVAILABLE:
+        options["extractor_args"] = {"generic": {"impersonate": ["chrome"]}}
 
     cookies_file = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
     if cookies_file:
@@ -218,39 +365,74 @@ def _yt_dlp_extract(url: str) -> dict[str, Any]:
     if not media_url:
         raise RuntimeError("yt-dlp found the video but no direct media URL")
 
-    thumbnail = info.get("thumbnail") or ""
-    author = info.get("uploader_id") or info.get("uploader") or info.get("creator") or "Unknown"
     title = info.get("title") or info.get("description") or "TikTok Video"
-
-    return {
-        "success": True,
-        "download_url": media_url,
-        "full_url": media_url,
-        "title": title,
-        "author": author,
-        "caption": info.get("description") or title,
-        "thumbnail": thumbnail,
-        "duration": info.get("duration") or 0,
-        "plays": info.get("view_count") or 0,
-        "likes": info.get("like_count") or 0,
-        "comments": info.get("comment_count") or 0,
-        "shares": info.get("repost_count") or 0,
-        "filename": "tiktok_video.mp4",
-        "api_source": "yt-dlp",
-    }
+    return normalize_result(
+        media_url=media_url,
+        title=title,
+        author=info.get("uploader_id") or info.get("uploader") or info.get("creator") or "Unknown",
+        caption=info.get("description") or title,
+        thumbnail=info.get("thumbnail") or "",
+        duration=info.get("duration"),
+        plays=info.get("view_count"),
+        likes=info.get("like_count"),
+        comments=info.get("comment_count"),
+        shares=info.get("repost_count"),
+        source="yt-dlp",
+    )
 
 
 async def download_with_ytdlp(url: str) -> dict[str, Any]:
-    return await asyncio.wait_for(asyncio.to_thread(_yt_dlp_extract, url), timeout=45)
+    if not ENABLE_YTDLP:
+        raise RuntimeError("disabled")
+    return await asyncio.wait_for(asyncio.to_thread(_yt_dlp_extract, url), timeout=35)
+
+
+async def try_provider(name: str, provider: Callable[[str], Awaitable[dict[str, Any]]], url: str):
+    started = time.monotonic()
+    try:
+        result = await provider(url)
+        return name, result, None, round((time.monotonic() - started) * 1000)
+    except Exception as exc:
+        return name, None, str(exc), round((time.monotonic() - started) * 1000)
+
+
+async def race_primary_providers(url: str):
+    providers: list[tuple[str, Callable[[str], Awaitable[dict[str, Any]]]]] = [("TikWM", download_with_tikwm)]
+    if ENABLE_TDOWN:
+        providers.append(("TDOWN", download_with_tdown))
+
+    tasks = [asyncio.create_task(try_provider(name, provider, url)) for name, provider in providers]
+    failures: list[dict[str, Any]] = []
+    try:
+        for future in asyncio.as_completed(tasks):
+            name, result, error, elapsed_ms = await future
+            if result:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                logger.info("Provider %s succeeded in %sms", name, elapsed_ms)
+                return result, failures
+            failures.append({"provider": name, "error": error, "elapsed_ms": elapsed_ms})
+            logger.warning("Provider %s failed in %sms: %s", name, elapsed_ms, error)
+    finally:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return None, failures
 
 
 @app.get("/")
 async def root():
+    providers = ["TikWM"]
+    if ENABLE_TDOWN:
+        providers.append("TDOWN")
+    if ENABLE_YTDLP:
+        providers.append("yt-dlp")
+    if ENABLE_GODOWNLOADER:
+        providers.append("GoDownloader")
     return {
         "status": "running",
         "service": "CyberVid TikTok Downloader API",
         "version": APP_VERSION,
-        "providers": ["TikWM GET/POST", "yt-dlp fallback"],
+        "providers": providers,
     }
 
 
@@ -260,7 +442,13 @@ async def health():
         "status": "healthy",
         "service": "CyberVid media resolver",
         "version": APP_VERSION,
+        "tikwm_api": TIKWM_API,
+        "tdown_enabled": ENABLE_TDOWN,
+        "yt_dlp_enabled": ENABLE_YTDLP,
         "yt_dlp_available": YoutubeDL is not None,
+        "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", None) if yt_dlp else None,
+        "curl_cffi_available": CURL_CFFI_AVAILABLE,
+        "godownloader_enabled": ENABLE_GODOWNLOADER,
     }
 
 
@@ -276,30 +464,41 @@ async def download_video(
 
     client_ip = (x_client_ip or (request.client.host if request.client else "unknown")).split(",")[0].strip()
     limiter.check(client_ip)
-
     url = validate_tiktok_url(str(payload.url))
-    errors: list[str] = []
 
-    providers = (
-        ("TikWM", download_with_tikwm),
-        ("yt-dlp", download_with_ytdlp),
-    )
+    errors: list[dict[str, Any]] = []
 
-    for name, provider in providers:
-        try:
-            logger.info("Trying provider %s", name)
-            result = await provider(url)
-            logger.info("Provider %s succeeded", name)
+    # Race the two lightweight HTTP providers so a blocked provider does not
+    # make users wait before the healthy provider is tried.
+    result, primary_errors = await race_primary_providers(url)
+    errors.extend(primary_errors)
+    if result:
+        return JSONResponse(result)
+
+    # yt-dlp is heavier, so only invoke it after the fast providers fail.
+    if ENABLE_YTDLP:
+        name, result, error, elapsed_ms = await try_provider("yt-dlp", download_with_ytdlp, url)
+        if result:
+            logger.info("Provider %s succeeded in %sms", name, elapsed_ms)
             return JSONResponse(result)
-        except Exception as exc:
-            message = f"{name}: {exc}"
-            errors.append(message)
-            logger.warning("Provider failed: %s", message)
+        errors.append({"provider": name, "error": error, "elapsed_ms": elapsed_ms})
+        logger.warning("Provider %s failed in %sms: %s", name, elapsed_ms, error)
 
-    response = {
+    # The public GoDownloader endpoint has a very small free quota, so it is
+    # opt-in rather than consuming the quota on every request.
+    if ENABLE_GODOWNLOADER:
+        name, result, error, elapsed_ms = await try_provider("GoDownloader", download_with_godownloader, url)
+        if result:
+            logger.info("Provider %s succeeded in %sms", name, elapsed_ms)
+            return JSONResponse(result)
+        errors.append({"provider": name, "error": error, "elapsed_ms": elapsed_ms})
+        logger.warning("Provider %s failed in %sms: %s", name, elapsed_ms, error)
+
+    response: dict[str, Any] = {
         "success": False,
-        "error": "The TikTok provider is temporarily unavailable or rejected this video. Please verify the video is public and try again shortly.",
-        "tried_apis": [name for name, _ in providers],
+        "error": "No download provider could resolve this public TikTok video right now.",
+        "code": "ALL_PROVIDERS_FAILED",
+        "version": APP_VERSION,
     }
     if DEBUG_PROVIDER_ERRORS:
         response["provider_errors"] = errors
