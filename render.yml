@@ -1,14 +1,21 @@
 services:
   - type: web
-    name: tiktok-api
-    env: python
-    region: oregon
+    name: cybervid-api
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: PORT
-        value: 10000
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
+    envVars:
+      - key: RATE_LIMIT_PER_MINUTE
+        value: 30
+      - key: DEBUG_PROVIDER_ERRORS
+        value: "true"
+      - key: ENABLE_TDOWN
+        value: "true"
+      - key: ENABLE_YTDLP
+        value: "true"
+      - key: ENABLE_GODOWNLOADER
+        value: "false"
+      - key: API_SHARED_SECRET
+        sync: false
