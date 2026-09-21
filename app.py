@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cybervid")
 
-APP_VERSION = "6.0"
+APP_VERSION = "6.1"
 TIKWM_API = os.getenv("TIKWM_API_URL", "https://tikwm.com/api/").strip()
 TDOWN_API = os.getenv("TDOWN_API_URL", "https://tdownv4.sl-bjs.workers.dev/").strip()
 GODOWNLOADER_API = os.getenv(
