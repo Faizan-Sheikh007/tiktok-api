@@ -1,362 +1,307 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import asyncio
 import logging
-from datetime import datetime
 import os
-import re
+import time
+from collections import defaultdict, deque
+from typing import Any
+from urllib.parse import urlparse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, HttpUrl
+
+try:
+    from yt_dlp import YoutubeDL
+except Exception:  # pragma: no cover
+    YoutubeDL = None
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("cybervid")
+
+APP_VERSION = "5.0"
+TIKWM_API = "https://www.tikwm.com/api/"
+API_SHARED_SECRET = os.getenv("API_SHARED_SECRET", "").strip()
+DEBUG_PROVIDER_ERRORS = os.getenv("DEBUG_PROVIDER_ERRORS", "false").lower() == "true"
+
+ALLOWED_ORIGINS = [
+    "https://cybervid.online",
+    "https://www.cybervid.online",
+    "http://localhost:3000",
+    "http://localhost:5500",
+    "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5500",
+    "http://127.0.0.1:8000",
+]
+ALLOWED_HOSTS = {
+    "tiktok.com",
+    "www.tiktok.com",
+    "m.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+}
 
 app = FastAPI(
-    title="CyberOrion TikTok Downloader API",
-    version="4.0",
-    description="Download TikTok videos without watermark - No cookies required"
+    title="CyberVid TikTok Downloader API",
+    version=APP_VERSION,
+    description="Server-side media resolver used by cybervid.online",
 )
-
-# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://cybervid.online",
-        "http://cybervid.online",
-        "https://www.cybervid.online",
-        "http://www.cybervid.online",
-        "http://localhost:3000",
-        "http://localhost:5500",
-        "http://localhost:8000",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5500",
-        "http://127.0.0.1:8000"
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "DELETE", "PUT"],
-    allow_headers=["*"],
-    expose_headers=["*"]
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "X-API-Key", "X-Client-IP", "X-CyberVid-Request"],
 )
 
-# API endpoints
-TIKWM_API = "https://www.tikwm.com/api/"
-TIKMATE_API = "https://tikmate.app/api/lookup"
 
-class RateLimiter:
-    """Simple rate limiter"""
-    def __init__(self, max_requests=10, time_window=60):
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests = {}
-    
-    def check_rate_limit(self, ip: str):
-        import time
-        now = time.time()
-        
-        if ip not in self.requests:
-            self.requests[ip] = []
-        
-        # Remove old requests
-        self.requests[ip] = [r for r in self.requests[ip] if now - r < self.time_window]
-        
-        if len(self.requests[ip]) >= self.max_requests:
-            wait_time = self.time_window - (now - self.requests[ip][0])
+class DownloadRequest(BaseModel):
+    url: HttpUrl
+
+
+class SlidingWindowLimiter:
+    def __init__(self, limit: int = 30, window_seconds: int = 60):
+        self.limit = limit
+        self.window = window_seconds
+        self.hits: dict[str, deque[float]] = defaultdict(deque)
+
+    def check(self, key: str) -> None:
+        now = time.monotonic()
+        bucket = self.hits[key]
+        while bucket and now - bucket[0] >= self.window:
+            bucket.popleft()
+        if len(bucket) >= self.limit:
+            retry_after = max(1, int(self.window - (now - bucket[0])))
             raise HTTPException(
                 status_code=429,
-                detail={
-                    "error": "Too many requests",
-                    "message": f"Please wait {int(wait_time)} seconds",
-                    "retry_after": int(wait_time)
-                }
+                detail={"error": "Too many requests", "retry_after": retry_after},
+                headers={"Retry-After": str(retry_after)},
             )
-        
-        self.requests[ip].append(now)
+        bucket.append(now)
 
-rate_limiter = RateLimiter(max_requests=10, time_window=60)
 
-def extract_video_id(url: str) -> str:
-    """Extract video ID from TikTok URL"""
-    patterns = [
-        r'/@[\w.-]+/video/(\d+)',
-        r'/v/(\d+)',
-        r'video/(\d+)',
-        r'/(\d+)'
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    
-    return None
+limiter = SlidingWindowLimiter(
+    limit=int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
+    window_seconds=60,
+)
 
-async def download_with_tikwm(url: str) -> dict:
-    """Download using TikWM API (Primary method)"""
-    try:
-        logger.info(f"🔄 Trying TikWM API for: {url}")
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                TIKWM_API,
-                data={
-                    "url": url,
-                    "hd": "1"
-                },
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json"
-                }
-            )
-            
-            logger.info(f"TikWM response status: {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"TikWM response data: {data}")
-                
-                if data.get("code") == 0:
-                    video_data = data.get("data", {})
-                    
-                    # Get video URL (try HD first, fallback to SD)
-                    video_url = video_data.get("hdplay") or video_data.get("play")
-                    
-                    if not video_url:
-                        logger.error("No video URL found in response")
-                        return {"success": False, "error": "No video URL in response"}
-                    
-                    logger.info(f"✅ TikWM Success! Video URL: {video_url[:50]}...")
-                    
-                    return {
-                        "success": True,
-                        "download_url": video_url,
-                        "title": video_data.get("title", "TikTok Video"),
-                        "author": video_data.get("author", {}).get("unique_id", "Unknown"),
-                        "caption": video_data.get("title", ""),
-                        "thumbnail": video_data.get("cover", ""),
-                        "duration": video_data.get("duration", 0),
-                        "plays": video_data.get("play_count", 0),
-                        "likes": video_data.get("digg_count", 0),
-                        "comments": video_data.get("comment_count", 0),
-                        "shares": video_data.get("share_count", 0),
-                        "api_source": "TikWM"
-                    }
+
+def validate_tiktok_url(value: str) -> str:
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http/https URLs are supported")
+    if host not in ALLOWED_HOSTS and not host.endswith(".tiktok.com"):
+        raise HTTPException(status_code=400, detail="Please provide a valid TikTok URL")
+    if "/photo/" in parsed.path:
+        raise HTTPException(status_code=400, detail="TikTok photo posts are not currently supported")
+    return value
+
+
+def parse_tikwm(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("code") not in (0, "0"):
+        raise RuntimeError(str(data.get("msg") or data.get("message") or "TikWM rejected the request"))
+
+    video = data.get("data") or {}
+    media_url = video.get("hdplay") or video.get("play") or video.get("wmplay")
+    if not media_url:
+        raise RuntimeError("TikWM returned no playable video URL")
+
+    author_data = video.get("author") or {}
+    if isinstance(author_data, dict):
+        author = author_data.get("unique_id") or author_data.get("nickname") or "Unknown"
+    else:
+        author = str(author_data or "Unknown")
+
+    return {
+        "success": True,
+        "download_url": media_url,
+        "full_url": media_url,
+        "title": video.get("title") or "TikTok Video",
+        "author": author,
+        "caption": video.get("title") or "",
+        "thumbnail": video.get("cover") or video.get("origin_cover") or "",
+        "duration": video.get("duration") or 0,
+        "plays": video.get("play_count") or 0,
+        "likes": video.get("digg_count") or 0,
+        "comments": video.get("comment_count") or 0,
+        "shares": video.get("share_count") or 0,
+        "filename": "tiktok_video.mp4",
+        "api_source": "TikWM",
+    }
+
+
+async def download_with_tikwm(url: str) -> dict[str, Any]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.tikwm.com",
+        "Referer": "https://www.tikwm.com/",
+    }
+    timeout = httpx.Timeout(30.0, connect=12.0)
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        # TikWM's public interface is primarily GET-based. The older CyberVid
+        # deployment only POSTed here, so try GET first and keep POST as a compatibility fallback.
+        last_error = "TikWM request failed"
+        for method in ("GET", "POST"):
+            try:
+                if method == "GET":
+                    response = await client.get(TIKWM_API, params={"url": url, "hd": "1"})
                 else:
-                    error_msg = data.get("msg", "Unknown error")
-                    logger.error(f"TikWM API error: {error_msg}")
-                    return {"success": False, "error": f"TikWM: {error_msg}"}
-            else:
-                logger.error(f"TikWM status code: {response.status_code}")
-                return {"success": False, "error": f"TikWM returned {response.status_code}"}
-                
-    except httpx.TimeoutException:
-        logger.error("TikWM timeout")
-        return {"success": False, "error": "TikWM API timeout"}
-    except Exception as e:
-        logger.error(f"TikWM exception: {str(e)}")
-        return {"success": False, "error": f"TikWM error: {str(e)}"}
+                    response = await client.post(TIKWM_API, data={"url": url, "hd": "1"})
 
-async def download_with_snapsave(url: str) -> dict:
-    """Download using SnapSave API (Fallback method)"""
-    try:
-        logger.info(f"🔄 Trying SnapSave API for: {url}")
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # SnapSave requires a two-step process
-            response = await client.post(
-                "https://snapsave.app/action.php?lang=en",
-                data={
-                    "url": url
-                },
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Accept": "*/*"
-                }
-            )
-            
-            if response.status_code == 200:
-                # Parse HTML response to extract download URL
-                html = response.text
-                
-                # Look for download URL in HTML
-                import re
-                url_pattern = r'href="([^"]+)"[^>]*>Download'
-                match = re.search(url_pattern, html)
-                
-                if match:
-                    download_url = match.group(1)
-                    logger.info(f"✅ SnapSave Success!")
-                    
-                    return {
-                        "success": True,
-                        "download_url": download_url,
-                        "title": "TikTok Video",
-                        "author": "Unknown",
-                        "caption": "",
-                        "thumbnail": "",
-                        "api_source": "SnapSave"
-                    }
-                else:
-                    return {"success": False, "error": "Could not parse SnapSave response"}
-            else:
-                return {"success": False, "error": f"SnapSave returned {response.status_code}"}
-                
-    except Exception as e:
-        logger.error(f"SnapSave exception: {str(e)}")
-        return {"success": False, "error": f"SnapSave error: {str(e)}"}
+                if response.status_code != 200:
+                    last_error = f"TikWM returned HTTP {response.status_code}"
+                    continue
+
+                try:
+                    payload = response.json()
+                except ValueError:
+                    last_error = "TikWM returned a non-JSON response"
+                    continue
+
+                return parse_tikwm(payload)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = f"TikWM network error: {type(exc).__name__}"
+            except Exception as exc:
+                last_error = str(exc)
+
+    raise RuntimeError(last_error)
+
+
+def _yt_dlp_extract(url: str) -> dict[str, Any]:
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp is not installed")
+
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "cachedir": False,
+        "socket_timeout": 30,
+        "retries": 1,
+        "format": "best[ext=mp4]/best",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        },
+    }
+
+    cookies_file = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        raise RuntimeError("yt-dlp returned no video information")
+    if info.get("entries"):
+        info = next((entry for entry in info["entries"] if entry), None)
+        if not info:
+            raise RuntimeError("yt-dlp returned an empty result")
+
+    media_url = info.get("url")
+    if not media_url:
+        candidates = [
+            f for f in (info.get("formats") or [])
+            if f.get("url") and f.get("vcodec") != "none" and str(f.get("protocol", "")).startswith("http")
+        ]
+        candidates.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+        if candidates:
+            media_url = candidates[0]["url"]
+
+    if not media_url:
+        raise RuntimeError("yt-dlp found the video but no direct media URL")
+
+    thumbnail = info.get("thumbnail") or ""
+    author = info.get("uploader_id") or info.get("uploader") or info.get("creator") or "Unknown"
+    title = info.get("title") or info.get("description") or "TikTok Video"
+
+    return {
+        "success": True,
+        "download_url": media_url,
+        "full_url": media_url,
+        "title": title,
+        "author": author,
+        "caption": info.get("description") or title,
+        "thumbnail": thumbnail,
+        "duration": info.get("duration") or 0,
+        "plays": info.get("view_count") or 0,
+        "likes": info.get("like_count") or 0,
+        "comments": info.get("comment_count") or 0,
+        "shares": info.get("repost_count") or 0,
+        "filename": "tiktok_video.mp4",
+        "api_source": "yt-dlp",
+    }
+
+
+async def download_with_ytdlp(url: str) -> dict[str, Any]:
+    return await asyncio.wait_for(asyncio.to_thread(_yt_dlp_extract, url), timeout=45)
+
 
 @app.get("/")
 async def root():
-    """API information endpoint"""
     return {
         "status": "running",
-        "service": "CyberOrion TikTok Downloader API",
-        "version": "4.0",
-        "method": "External API (No cookies needed)",
-        "platform": "Render.com",
-        "framework": "FastAPI",
-        "apis": {
-            "primary": "TikWM API",
-            "fallback": "SnapSave API"
-        },
-        "features": [
-            "No cookies required",
-            "HD video quality",
-            "Rate limiting",
-            "Auto-fallback",
-            "Video metadata"
-        ],
-        "endpoints": {
-            "/download": "POST - Download TikTok video",
-            "/health": "GET - Health check"
-        },
-        "timestamp": datetime.now().isoformat()
+        "service": "CyberVid TikTok Downloader API",
+        "version": APP_VERSION,
+        "providers": ["TikWM GET/POST", "yt-dlp fallback"],
     }
+
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "method": "External API",
-        "requires_cookies": False,
-        "platform": "Render.com",
-        "timestamp": datetime.now().isoformat()
+        "service": "CyberVid media resolver",
+        "version": APP_VERSION,
+        "yt_dlp_available": YoutubeDL is not None,
     }
 
-@app.post("/download")
-async def download_video(request: Request):
-    """Download TikTok video using external APIs"""
-    try:
-        # Rate limiting
-        client_ip = request.client.host
-        rate_limiter.check_rate_limit(client_ip)
-        
-        # Get request data
-        data = await request.json()
-        
-        if not data or 'url' not in data:
-            logger.warning("⚠️ No URL provided")
-            return JSONResponse(
-                content={"success": False, "error": "No URL provided"},
-                status_code=400
-            )
-        
-        tiktok_url = data['url']
-        
-        # Validate TikTok URL
-        valid_domains = ['tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com']
-        if not any(domain in tiktok_url for domain in valid_domains):
-            logger.warning(f"⚠️ Invalid URL: {tiktok_url}")
-            return JSONResponse(
-                content={"success": False, "error": "Invalid TikTok URL"},
-                status_code=400
-            )
-        
-        # Check for photo posts
-        if '/photo/' in tiktok_url:
-            logger.info(f"⚠️ Photo post detected: {tiktok_url}")
-            return JSONResponse(
-                content={
-                    "success": False, 
-                    "error": "TikTok photo posts (slideshows) are not supported. Please use a video post."
-                },
-                status_code=400
-            )
-        
-        logger.info(f"🎬 Processing: {tiktok_url}")
-        logger.info(f"📍 Client IP: {client_ip}")
-        
-        # Try TikWM API first
-        result = await download_with_tikwm(tiktok_url)
-        
-        # If TikWM fails, try SnapSave as fallback
-        if not result.get("success"):
-            logger.warning(f"⚠️ TikWM failed, trying SnapSave...")
-            result = await download_with_snapsave(tiktok_url)
-        
-        if result.get("success"):
-            logger.info(f"✅ Success via {result.get('api_source', 'Unknown')} API")
-            
-            # Return response matching your Laravel controller's expected format
-            return JSONResponse(content={
-                "success": True,
-                "download_url": result["download_url"],
-                "full_url": result["download_url"],  # Direct URL from API
-                "title": result.get("title", "TikTok Video"),
-                "author": result.get("author", "Unknown"),
-                "caption": result.get("caption", "No caption available"),
-                "thumbnail": result.get("thumbnail", ""),
-                "filename": f"tiktok_video.mp4",
-                "message": "Video ready for download",
-                "api_source": result.get("api_source", "External API"),
-                "stats": {
-                    "duration": result.get("duration", 0),
-                    "plays": result.get("plays", 0),
-                    "likes": result.get("likes", 0),
-                    "comments": result.get("comments", 0),
-                    "shares": result.get("shares", 0)
-                }
-            })
-        else:
-            error_msg = result.get("error", "All download methods failed")
-            logger.error(f"❌ All APIs failed: {error_msg}")
-            
-            return JSONResponse(
-                content={
-                    "success": False,
-                    "error": error_msg,
-                    "tried_apis": ["TikWM", "SnapSave"],
-                    "suggestion": "Please verify the TikTok URL is correct and the video is public"
-                },
-                status_code=503
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Unexpected error: {str(e)}", exc_info=True)
-        return JSONResponse(
-            content={
-                "success": False, 
-                "error": f"Server error: {str(e)}"
-            },
-            status_code=500
-        )
 
-@app.options("/download")
-async def download_options():
-    """Handle CORS preflight for download endpoint"""
-    return JSONResponse(
-        content={},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        }
+@app.post("/download")
+async def download_video(
+    payload: DownloadRequest,
+    request: Request,
+    x_client_ip: str | None = Header(default=None, alias="X-Client-IP"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+):
+    if API_SHARED_SECRET and x_api_key != API_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    client_ip = (x_client_ip or (request.client.host if request.client else "unknown")).split(",")[0].strip()
+    limiter.check(client_ip)
+
+    url = validate_tiktok_url(str(payload.url))
+    errors: list[str] = []
+
+    providers = (
+        ("TikWM", download_with_tikwm),
+        ("yt-dlp", download_with_ytdlp),
     )
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🚀 Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    for name, provider in providers:
+        try:
+            logger.info("Trying provider %s", name)
+            result = await provider(url)
+            logger.info("Provider %s succeeded", name)
+            return JSONResponse(result)
+        except Exception as exc:
+            message = f"{name}: {exc}"
+            errors.append(message)
+            logger.warning("Provider failed: %s", message)
+
+    response = {
+        "success": False,
+        "error": "The TikTok provider is temporarily unavailable or rejected this video. Please verify the video is public and try again shortly.",
+        "tried_apis": [name for name, _ in providers],
+    }
+    if DEBUG_PROVIDER_ERRORS:
+        response["provider_errors"] = errors
+
+    return JSONResponse(response, status_code=502)
