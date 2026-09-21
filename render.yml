@@ -11,6 +11,8 @@ services:
         value: 30
       - key: DEBUG_PROVIDER_ERRORS
         value: "false"
+      - key: MEDIA_PROXY_TTL
+        value: "900"
       - key: ENABLE_TDOWN
         value: "true"
       - key: ENABLE_YTDLP
