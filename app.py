@@ -6,6 +6,8 @@ import ipaddress
 import secrets
 import socket
 import logging
+import tempfile
+from pathlib import Path
 import os
 import re
 import time
@@ -16,8 +18,9 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
+from starlette.background import BackgroundTask
 
 try:
     import yt_dlp
@@ -35,7 +38,7 @@ except Exception:  # pragma: no cover
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cybervid")
 
-APP_VERSION = "6.2"
+APP_VERSION = "6.3"
 TIKWM_API = os.getenv("TIKWM_API_URL", "https://tikwm.com/api/").strip()
 TDOWN_API = os.getenv("TDOWN_API_URL", "https://tdownv4.sl-bjs.workers.dev/").strip()
 GODOWNLOADER_API = os.getenv(
@@ -131,24 +134,25 @@ def _sign_media_token(token: str, expires: int) -> str:
     return hmac.new(MEDIA_PROXY_SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
-def build_media_proxy_url(request: Request, upstream_url: str) -> str:
+def build_media_proxy_url(request: Request, source_tiktok_url: str) -> str:
+    # Sign the ORIGINAL TikTok post URL, not the provider's temporary CDN URL.
+    # TikTok webapp-prime CDN links can be session/IP bound and often return 403
+    # when replayed from another client. /media re-resolves and downloads the post
+    # in one yt-dlp session instead.
     expires = int(time.time()) + max(60, MEDIA_PROXY_TTL)
-    token = _b64url_encode(upstream_url)
+    token = _b64url_encode(source_tiktok_url)
     signature = _sign_media_token(token, expires)
     base_url = str(request.base_url).rstrip("/")
     return f"{base_url}/media?token={token}&expires={expires}&sig={signature}"
 
 
-def proxify_result(result: dict[str, Any], request: Request) -> dict[str, Any]:
-    upstream_url = result.get("download_url") or result.get("full_url")
-    if not isinstance(upstream_url, str) or not upstream_url.startswith(("http://", "https://")):
-        raise RuntimeError("Provider returned an invalid media URL")
-
+def proxify_result(result: dict[str, Any], request: Request, source_tiktok_url: str) -> dict[str, Any]:
     output = dict(result)
-    proxy_url = build_media_proxy_url(request, upstream_url)
+    proxy_url = build_media_proxy_url(request, source_tiktok_url)
     output["download_url"] = proxy_url
     output["full_url"] = proxy_url
     output["proxied"] = True
+    output["proxy_mode"] = "yt-dlp-session"
     return output
 
 
@@ -553,6 +557,87 @@ async def root():
     }
 
 
+def _download_tiktok_to_temp(source_url: str) -> str:
+    """Resolve and download a TikTok post inside one yt-dlp session.
+
+    This intentionally avoids replaying provider-returned webapp-prime URLs,
+    which can be tied to the resolver's session/IP and return HTTP 403 elsewhere.
+    """
+    if YoutubeDL is None:
+        raise RuntimeError("yt-dlp is not installed")
+
+    fd, base_path = tempfile.mkstemp(prefix="cybervid_", suffix=".mp4")
+    os.close(fd)
+    try:
+        os.unlink(base_path)
+    except FileNotFoundError:
+        pass
+
+    outtmpl = base_path.rsplit(".mp4", 1)[0] + ".%(ext)s"
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "cachedir": False,
+        "socket_timeout": 30,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 2,
+        "format": "best[ext=mp4]/best",
+        "outtmpl": outtmpl,
+        "restrictfilenames": True,
+        "overwrites": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+            "Referer": source_url,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+
+    # If you later provide a Netscape cookies file on Render, yt-dlp can use it
+    # without any code changes.
+    cookies_file = os.getenv("TIKTOK_COOKIES_FILE", "").strip()
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(source_url, download=True)
+        if not info:
+            raise RuntimeError("yt-dlp returned no video information")
+        if info.get("entries"):
+            info = next((entry for entry in info["entries"] if entry), None)
+            if not info:
+                raise RuntimeError("yt-dlp returned an empty result")
+
+        requested = info.get("requested_downloads") or []
+        candidates: list[str] = []
+        for item in requested:
+            if isinstance(item, dict):
+                fp = item.get("filepath")
+                if fp:
+                    candidates.append(fp)
+
+        filename = info.get("_filename")
+        if filename:
+            candidates.append(filename)
+
+        try:
+            candidates.append(ydl.prepare_filename(info))
+        except Exception:
+            pass
+
+    # yt-dlp may normalize the extension; locate the actual completed file.
+    stem = Path(base_path).with_suffix("")
+    candidates.extend(str(p) for p in stem.parent.glob(stem.name + ".*"))
+
+    for candidate in candidates:
+        p = Path(candidate)
+        if p.is_file() and p.stat().st_size > 0 and not p.name.endswith(".part"):
+            return str(p)
+
+    raise RuntimeError("yt-dlp finished but no media file was created")
+
+
 @app.get("/health")
 async def health():
     return {
@@ -571,7 +656,6 @@ async def health():
 
 @app.get("/media")
 async def media_proxy(
-    request: Request,
     token: str,
     expires: int,
     sig: str,
@@ -584,45 +668,50 @@ async def media_proxy(
         raise HTTPException(status_code=403, detail="Invalid download signature")
 
     try:
-        upstream_url = _b64url_decode(token)
+        source_url = _b64url_decode(token)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid download token") from exc
 
-    range_header = request.headers.get("range")
-    client, upstream = await open_media_stream(upstream_url, range_header)
+    # The signed token must contain a TikTok post URL. This also prevents /media
+    # from becoming an open proxy for arbitrary hosts.
+    source_url = validate_tiktok_url(source_url)
 
-    response_headers = {
-        "Content-Disposition": 'attachment; filename="tiktok_video.mp4"',
-        "Cache-Control": "private, no-store, max-age=0",
-        "X-Content-Type-Options": "nosniff",
-    }
+    if not ENABLE_YTDLP or YoutubeDL is None:
+        raise HTTPException(status_code=503, detail="Server-side downloader is unavailable")
 
-    for source_header, output_header in (
-        ("content-length", "Content-Length"),
-        ("content-range", "Content-Range"),
-        ("accept-ranges", "Accept-Ranges"),
-        ("etag", "ETag"),
-        ("last-modified", "Last-Modified"),
-    ):
-        value = upstream.headers.get(source_header)
-        if value:
-            response_headers[output_header] = value
+    try:
+        file_path = await asyncio.wait_for(
+            asyncio.to_thread(_download_tiktok_to_temp, source_url),
+            timeout=90,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="TikTok download timed out. Please try again.") from exc
+    except Exception as exc:
+        logger.warning("Server-side TikTok download failed: %s", exc)
+        detail = "TikTok rejected the server-side download. Please try again with a fresh link."
+        if DEBUG_PROVIDER_ERRORS:
+            detail = f"{detail} ({exc})"
+        raise HTTPException(status_code=502, detail=detail) from exc
 
-    media_type = upstream.headers.get("content-type", "video/mp4").split(";")[0]
+    path = Path(file_path)
+    suffix = path.suffix.lower() or ".mp4"
+    media_type = "video/mp4" if suffix == ".mp4" else "application/octet-stream"
 
-    async def body():
+    def cleanup() -> None:
         try:
-            async for chunk in upstream.aiter_raw():
-                yield chunk
-        finally:
-            await upstream.aclose()
-            await client.aclose()
+            path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Could not remove temporary media file %s", path)
 
-    return StreamingResponse(
-        body(),
-        status_code=upstream.status_code,
+    return FileResponse(
+        path=str(path),
         media_type=media_type,
-        headers=response_headers,
+        filename=f"tiktok_video{suffix}",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        },
+        background=BackgroundTask(cleanup),
     )
 
 
@@ -647,14 +736,14 @@ async def download_video(
     result, primary_errors = await race_primary_providers(url)
     errors.extend(primary_errors)
     if result:
-        return JSONResponse(proxify_result(result, request))
+        return JSONResponse(proxify_result(result, request, url))
 
     # yt-dlp is heavier, so only invoke it after the fast providers fail.
     if ENABLE_YTDLP:
         name, result, error, elapsed_ms = await try_provider("yt-dlp", download_with_ytdlp, url)
         if result:
             logger.info("Provider %s succeeded in %sms", name, elapsed_ms)
-            return JSONResponse(proxify_result(result, request))
+            return JSONResponse(proxify_result(result, request, url))
         errors.append({"provider": name, "error": error, "elapsed_ms": elapsed_ms})
         logger.warning("Provider %s failed in %sms: %s", name, elapsed_ms, error)
 
@@ -664,7 +753,7 @@ async def download_video(
         name, result, error, elapsed_ms = await try_provider("GoDownloader", download_with_godownloader, url)
         if result:
             logger.info("Provider %s succeeded in %sms", name, elapsed_ms)
-            return JSONResponse(proxify_result(result, request))
+            return JSONResponse(proxify_result(result, request, url))
         errors.append({"provider": name, "error": error, "elapsed_ms": elapsed_ms})
         logger.warning("Provider %s failed in %sms: %s", name, elapsed_ms, error)
 
