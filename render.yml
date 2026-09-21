@@ -4,13 +4,13 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
       - key: RATE_LIMIT_PER_MINUTE
         value: 30
       - key: DEBUG_PROVIDER_ERRORS
-        value: "true"
+        value: "false"
       - key: ENABLE_TDOWN
         value: "true"
       - key: ENABLE_YTDLP
